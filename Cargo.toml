@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Petr Gadorek <hahihula@gmail.com>"]
 license = "MIT OR Apache-2.0"
 description = "An interactive terminal library for no_std embedded systems with line editing, history, and command parsing"
-repository = "´https://github.com/Hahihula/nostd-interactive-terminal"
+repository = "https://github.com/Hahihula/nostd-interactive-terminal"
 keywords = ["embedded", "no_std", "terminal", "uart", "esp32"]
 categories = ["embedded", "no-std"]
 
