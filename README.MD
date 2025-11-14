@@ -78,59 +78,117 @@ loop {
 Complete example for ESP32-C3 with USB Serial JTAG:
 
 ```rust
+//! Basic terminal example for ESP32-C3
+//! 
+//! This example demonstrates the simplest use of embedded-term
+//! with USB Serial JTAG on ESP32-C3.
+
 #![no_std]
 #![no_main]
 
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex, signal::Signal};
+use embassy_sync::{blocking_mutex::raw::NoopRawMutex, signal::Signal};
+
 use esp_hal::{
-    Async, clock::CpuClock,
-    usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx, UsbSerialJtagTx},
+    Async,
+    usb_serial_jtag::UsbSerialJtag,
+    interrupt::software::SoftwareInterruptControl,
+    timer::timg::TimerGroup,
 };
 use nostd_interactive_terminal::prelude::*;
-use static_cell::StaticCell;
+use esp_backtrace as _;
 
-#[embassy_executor::task]
-async fn terminal_task(
-    mut rx: UsbSerialJtagRx<'static, Async>,
-    tx_mutex: &'static Mutex<NoopRawMutex, UsbSerialJtagTx<'static, Async>>,
-    redraw_signal: &'static Signal<NoopRawMutex, ()>,
-) {
-    let config = TerminalConfig::default();
-    let history = History::new(HistoryConfig::default());
-    let mut reader = TerminalReader::<128>::new(config, Some(history));
+// This creates a default app-descriptor required by the esp-idf bootloader.
+esp_bootloader_esp_idf::esp_app_desc!();
 
-    loop {
-        let mut tx = tx_mutex.lock().await;
-        let mut writer = TerminalWriter::new(&mut *tx, true);
-        
-        match reader.read_line(&mut rx, &mut writer, Some(redraw_signal)).await {
-            Ok(command) => {
-                // Handle command
-                drop(tx); // Release lock before processing
-                // ... process command ...
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-#[esp_hal::main]
-async fn main(spawner: Spawner) {
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     
-    let (rx, tx) = UsbSerialJtag::new(peripherals.USB_DEVICE)
+    // Split USB Serial JTAG into RX and TX
+    let (mut rx, mut tx) = UsbSerialJtag::new(peripherals.USB_DEVICE)
         .into_async()
         .split();
     
-    static TX_MUTEX: StaticCell<Mutex<NoopRawMutex, UsbSerialJtagTx<'static, Async>>> = 
-        StaticCell::new();
-    let tx_mutex = &*TX_MUTEX.init(Mutex::new(tx));
+    // Create terminal configuration
+    let config = TerminalConfig {
+        buffer_size: 128,
+        prompt: "esp32c3> ",
+        echo: true,
+        ansi_enabled: true,
+    };
+
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
     
-    static REDRAW_SIGNAL: StaticCell<Signal<NoopRawMutex, ()>> = StaticCell::new();
-    let redraw_signal = &*REDRAW_SIGNAL.init(Signal::new());
+    // Create terminal reader with history
+    let history = History::new(nostd_interactive_terminal::HistoryConfig::default());
+    let mut reader = nostd_interactive_terminal::terminal::TerminalReader:: <128> ::new(config, Some(history));
+    let mut writer = TerminalWriter::new(&mut tx, true);
     
-    spawner.spawn(terminal_task(rx, tx_mutex, redraw_signal)).unwrap();
+    // Welcome message
+    writer.clear_screen().await.unwrap();
+    writer.writeln("=== ESP32-C3 Basic Terminal ===\r").await.unwrap();
+    writer.writeln("Type 'help' for available commands\r").await.unwrap();
+    writer.writeln("\r").await.unwrap();
+    
+    // Main command loop
+    loop {
+        match reader.read_line(&mut rx, &mut writer, Option::<&Signal<NoopRawMutex, ()>>::None).await {
+            Ok(command) => {
+                // Parse command
+                let parsed = match CommandParser::parse_simple::<4, 128>(&command) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        writer.write_error("Failed to parse command\r\n").await.unwrap();
+                        continue;
+                    }
+                };
+                
+                // Handle commands
+                match parsed.name() {
+                    "help" => {
+                        writer.writeln("Available commands:\r").await.unwrap();
+                        writer.writeln("  help      - Show this message\r").await.unwrap();
+                        writer.writeln("  echo      - Echo back arguments\r").await.unwrap();
+                        writer.writeln("  clear     - Clear the screen\r").await.unwrap();
+                        writer.writeln("  info      - Show system information\r").await.unwrap();
+                    }
+                    "echo" => {
+                        if let Some(args) = parsed.args_joined(" ") {
+                            writer.writeln(&args).await.unwrap();
+                            writer.writeln("\r").await.unwrap();
+                        } else {
+                            writer.write_error("Echo requires arguments\r\n").await.unwrap();
+                        }
+                    }
+                    "clear" => {
+                        writer.clear_screen().await.unwrap();
+                    }
+                    "info" => {
+                        writer.writeln("System Information:\r").await.unwrap();
+                        writer.writeln("  Device: ESP32-C3\r").await.unwrap();
+                        writer.writeln("  Interface: USB Serial JTAG\r").await.unwrap();
+                        writer.writeln("  Framework: Embassy (async)\r").await.unwrap();
+                    }
+                    _ => {
+                        {
+                            let mut msg: heapless::String<64> = heapless::String::new();
+                            msg.push_str("Unknown command: '").unwrap();
+                            msg.push_str(parsed.name()).unwrap();
+                            msg.push_str("'\r\n").unwrap();
+                            writer.write_error(&msg).await.unwrap();
+                        }
+                        writer.writeln("Type 'help' for available commands\r").await.unwrap();
+                    }
+                }
+            }
+            Err(_) => {
+                writer.write_error("Error reading line\r\n").await.unwrap();
+            }
+        }
+    }
 }
 ```
 
@@ -236,25 +294,18 @@ This crate is designed to work with any embedded platform that supports:
 
 Tested on:
 - ✅ ESP32-C3 (USB Serial JTAG)
+
+To be tested on:
 - ✅ ESP32-S3 (USB Serial JTAG, UART)
 - ✅ ESP32 (UART)
 - 🔄 Other Embassy-supported platforms (should work, not tested)
-
-## Examples
-
-See the `examples/` directory for complete examples:
-- `esp32c3_basic.rs` - Basic terminal for ESP32-C3
-- `esp32c3_full.rs` - Full-featured terminal with ESP-NOW integration
-- `command_handlers.rs` - Example command handler implementation
 
 ## License
 
 Licensed under either of:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
-at your option.
 
 ## Contributing
 
