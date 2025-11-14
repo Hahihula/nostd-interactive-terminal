@@ -53,6 +53,15 @@ pub struct Terminal<const BUF_SIZE: usize> {
     config: TerminalConfig,
     buffer: Vec<u8, BUF_SIZE>,
     cursor_pos: usize,
+    escape_state: EscapeState,
+}
+
+/// State machine for parsing ANSI escape sequences
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EscapeState {
+    Normal,
+    Escape,
+    Bracket,
 }
 
 impl<const BUF_SIZE: usize> Terminal<BUF_SIZE> {
@@ -62,6 +71,7 @@ impl<const BUF_SIZE: usize> Terminal<BUF_SIZE> {
             config,
             buffer: Vec::new(),
             cursor_pos: 0,
+            escape_state: EscapeState::Normal,
         }
     }
 
@@ -81,17 +91,44 @@ impl<const BUF_SIZE: usize> Terminal<BUF_SIZE> {
         self.cursor_pos
     }
 
-    /// Process a single byte of input
+    /// Process a single byte of input, handling ANSI escape sequences
     pub fn process_byte(&mut self, byte: u8) -> Option<KeyCode> {
-        match byte {
-            b'\r' | b'\n' => Some(KeyCode::Enter),
-            0x08 | 0x7F => Some(KeyCode::Backspace),
-            0x03 => Some(KeyCode::CtrlC),
-            0x04 => Some(KeyCode::CtrlD),
-            0x09 => Some(KeyCode::Tab),
-            0x1B => Some(KeyCode::Escape),
-            byte if byte >= 0x20 && byte < 0x7F => Some(KeyCode::Char(byte)),
-            _ => None,
+        match self.escape_state {
+            EscapeState::Normal => {
+                match byte {
+                    b'\r' | b'\n' => Some(KeyCode::Enter),
+                    0x08 | 0x7F => Some(KeyCode::Backspace),
+                    0x03 => Some(KeyCode::CtrlC),
+                    0x04 => Some(KeyCode::CtrlD),
+                    0x09 => Some(KeyCode::Tab),
+                    0x1B => {
+                        self.escape_state = EscapeState::Escape;
+                        None
+                    }
+                    byte if byte >= 0x20 && byte < 0x7F => Some(KeyCode::Char(byte)),
+                    _ => None,
+                }
+            }
+            EscapeState::Escape => {
+                if byte == b'[' {
+                    self.escape_state = EscapeState::Bracket;
+                    None
+                } else {
+                    self.escape_state = EscapeState::Normal;
+                    Some(KeyCode::Escape)
+                }
+            }
+            EscapeState::Bracket => {
+                self.escape_state = EscapeState::Normal;
+                match byte {
+                    b'A' => Some(KeyCode::ArrowUp),
+                    b'B' => Some(KeyCode::ArrowDown),
+                    b'C' => Some(KeyCode::ArrowRight),
+                    b'D' => Some(KeyCode::ArrowLeft),
+                    b'3' => Some(KeyCode::Delete), // Delete sends ESC[3~
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -138,6 +175,8 @@ impl<const BUF_SIZE: usize> Terminal<BUF_SIZE> {
                     TerminalEvent::None
                 }
             }
+            KeyCode::ArrowUp => TerminalEvent::HistoryPrevious,
+            KeyCode::ArrowDown => TerminalEvent::HistoryNext,
             KeyCode::CtrlC => TerminalEvent::Interrupt,
             KeyCode::CtrlD => TerminalEvent::EndOfFile,
             KeyCode::Char(byte) => {
@@ -185,6 +224,8 @@ pub enum TerminalEvent {
     BufferFull,
     Interrupt,
     EndOfFile,
+    HistoryPrevious,
+    HistoryNext,
 }
 
 /// Terminal reader task that handles async I/O
@@ -284,6 +325,31 @@ impl<const BUF_SIZE: usize> TerminalReader<BUF_SIZE> {
                 }
                 TerminalEvent::EndOfFile => {
                     return Err(ReadLineError::EndOfFile);
+                }
+                TerminalEvent::HistoryPrevious => {
+                    if let Some(ref mut hist) = self.history {
+                        if let Some(entry) = hist.previous() {
+                            let _ = self.terminal.set_buffer(entry);
+                            // Redraw the line
+                            writer.clear_line().await;
+                            writer.write_prompt(self.terminal.config.prompt).await;
+                            writer.write_str(self.terminal.buffer_str().unwrap_or("")).await;
+                        }
+                    }
+                }
+                TerminalEvent::HistoryNext => {
+                    if let Some(ref mut hist) = self.history {
+                        if let Some(entry) = hist.next() {
+                            let _ = self.terminal.set_buffer(entry);
+                        } else {
+                            // At the end of history, clear buffer
+                            self.terminal.clear_buffer();
+                        }
+                        // Redraw the line
+                        writer.clear_line().await;
+                        writer.write_prompt(self.terminal.config.prompt).await;
+                        writer.write_str(self.terminal.buffer_str().unwrap_or("")).await;
+                    }
                 }
                 TerminalEvent::BufferFull => {
                     // Optionally signal buffer full (beep?)
