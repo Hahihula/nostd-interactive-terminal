@@ -270,6 +270,8 @@ impl<const BUF_SIZE: usize> TerminalReader<BUF_SIZE> {
                             TerminalEvent::None
                         }
                     }
+                    Either::First(Ok(0)) => TerminalEvent::EndOfFile,
+                    Either::First(Err(_)) => return Err(ReadLineError::IoError),
                     Either::Second(_) => {
                         // Redraw requested
                         signal.reset();
@@ -290,6 +292,8 @@ impl<const BUF_SIZE: usize> TerminalReader<BUF_SIZE> {
                             TerminalEvent::None
                         }
                     }
+                    Ok(0) => TerminalEvent::EndOfFile,
+                    Err(_) => return Err(ReadLineError::IoError),
                     _ => continue,
                 }
             };
